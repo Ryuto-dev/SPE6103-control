@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SPE6103 Control (M1)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: 12px; height: 220px; overflow-y: auto; }
+  button { padding: 6px 12px; }
+</style>
+</head>
+<body>
+<h1>SPE6103 Control — M1接続確認</h1>
+<div class="row">
+  <select id="ports"></select>
+  <button id="refresh">更新</button>
+  <button id="connect">接続確認 (*IDN?)</button>
+</div>
+<div class="row">
+  <button data-q="VOLT?">VOLT?</button>
+  <button data-q="CURR?">CURR?</button>
+  <button data-q="MEAS:ALL?">MEAS:ALL?</button>
+  <button data-q="MEAS:ALL:INFO?">INFO?</button>
+  <button data-q="OUTP?">OUTP?</button>
+</div>
+<div id="log"></div>
+<script>
+const log = (m) => { document.getElementById('log').textContent += m + "\n"; };
+const invoke = (...a) => window.__TAURI__.core.invoke(...a);
+async function refreshPorts() {
+  const sel = document.getElementById('ports');
+  sel.innerHTML = "";
+  try {
+    const ports = await invoke('list_serial_ports');
+    ports.forEach(p => { const o = document.createElement('option'); o.value = o.textContent = p; sel.appendChild(o); });
+    if (!ports.length) log("(ポートなし)");
+  } catch (e) { log("list_serial_ports失敗: " + e); }
+}
+document.getElementById('refresh').onclick = refreshPorts;
+document.getElementById('connect').onclick = async () => {
+  const port = document.getElementById('ports').value;
+  try { log("*IDN? -> " + await invoke('psu_query', { port, cmd: "*IDN?", timeoutMs: 1500 })); }
+  catch (e) { log("失敗: " + e); }
+};
+document.querySelectorAll('[data-q]').forEach(b => b.onclick = async () => {
+  const port = document.getElementById('ports').value;
+  try { log(b.dataset.q + " -> " + await invoke('psu_query', { port, cmd: b.dataset.q, timeoutMs: 1500 })); }
+  catch (e) { log("失敗: " + e); }
+});
+refreshPorts();
+</script>
+</body>
+</html>

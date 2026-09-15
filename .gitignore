@@ -1,0 +1,7 @@
+# Binary / heavy artifacts
+OWON_SP_SPE_PCsoftware.zip
+*.zip
+__pycache__/
+*.pyc
+target/
+/app/src-tauri/target/
