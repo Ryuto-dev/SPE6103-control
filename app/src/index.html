@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
@@ -7,17 +7,135 @@
 <style>
   body { font-family: system-ui, sans-serif; margin: 24px; }
   .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
-  #log { white-space: pre-wrap; background: #f4f4f4; padding: 12px; height: 220px; overflow-y: auto; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: 12px; height: 160px; overflow-y: auto; }
+  #meas { font-size: 28px; font-weight: bold; }
+  #mode { font-size: 22px; font-weight: bold; }
+  #banner { display: none; background: #c00; color: #fff; padding: 8px; font-weight: bold; }
+  #graph { width: 100%; height: 220px; background: #fff; border: 1px solid #ccc; }
+  .lgV { color: #d62728; font-weight: bold; } .lgA { color: #1f77b4; font-weight: bold; } .lgW { color: #2ca02c; font-weight: bold; }
   button { padding: 6px 12px; }
+  input[type=number] { width: 90px; }
+  fieldset { margin: 12px 0; }
 </style>
 </head>
 <body>
-<h1>SPE6103 Control — M1接続確認</h1>
+<h1>SPE6103 Control — M1</h1>
+<div id="banner"></div>
+
+<fieldset><legend>接続</legend>
 <div class="row">
   <select id="ports"></select>
   <button id="refresh">更新</button>
-  <button id="connect">接続確認 (*IDN?)</button>
+  <button id="scan">自動スキャン</button>
+  <span id="conn">未接続</span>
+  <label><input type="checkbox" id="pollEn" /> 周期表示(1s)</label>
 </div>
+</fieldset>
+
+<fieldset><legend>設定・出力</legend>
+<div class="row">
+  Vset <input type="number" id="vset" min="0" max="60" step="0.01" value="8.40" /> V
+  Iset <input type="number" id="aset" min="0" max="10" step="0.001" value="1.250" /> A
+  <button id="apply">適用</button>
+  <span id="applyMsg"></span>
+</div>
+<div class="row">
+  <button id="onBtn">出力ON（確認あり）</button>
+  <button id="offBtn">出力OFF</button>
+</div>
+<div id="meas">-- V / -- A / -- W</div>
+<div id="mode">--</div>
+<div id="prot">OVP -- / OCP --</div>
+</fieldset>
+
+<fieldset><legend>グラフ＋ログ（M2）</legend>
+<div class="row">
+  <label class="lgV"><input type="checkbox" id="gV" checked /> V</label>
+  <label class="lgA"><input type="checkbox" id="gA" checked /> A</label>
+  <label class="lgW"><input type="checkbox" id="gW" /> W</label>
+  <button id="gClear">クリア</button>
+  <span id="gInfo"></span>
+</div>
+<canvas id="graph" width="900" height="220"></canvas>
+<div class="row">
+  <button id="logBtn">ログ開始</button>
+  間隔 <select id="logIv">
+    <option value="1000">1s</option>
+    <option value="2000">2s</option>
+    <option value="5000" selected>5s</option>
+    <option value="10000">10s</option>
+    <option value="30000">30s</option>
+    <option value="60000">60s</option>
+  </select>
+  <span id="logState">停止中</span>
+</div>
+</fieldset>
+
+<fieldset><legend>プリセット（M3）</legend>
+<div class="row">
+  <input id="psSearch" placeholder="検索" />
+  <button id="psSave">現在の設定を保存</button>
+  <button id="psExport">書出</button>
+  <label>読込 <input type="file" id="psImport" accept=".json,application/json" /></label>
+</div>
+<div id="psList"></div>
+</fieldset>
+
+<fieldset><legend>バッテリーMode（M3・CC/CV充電）</legend>
+<div style="color:#a00;font-weight:bold">※温度保護なし・BMSの代わりになりません。無人・フル遠隔での充電禁止。</div>
+<div class="row">
+  種別 <select id="batChem"><option value="lipo">Li-ion/LiPo (4.20V/cell)</option><option value="cccv">汎用CC/CV</option></select>
+  セル数 <input type="number" id="batCells" value="1" min="1" max="14" style="width:60px" />
+  <button id="batAutoV">Vset自動入力</button>
+</div>
+<div class="row">
+  Vset <input type="number" id="batV" min="0" max="60" step="0.01" value="4.20" /> V
+  Ilim <input type="number" id="batA" min="0" max="10" step="0.01" value="1.00" /> A
+  終止電流 <input type="number" id="batIterm" min="0" step="0.001" value="0.050" /> A
+</div>
+<div class="row">
+  最大時間 <input type="number" id="batTmax" min="1" value="180" style="width:70px" /> 分
+  最大容量 <input type="number" id="batAhmax" min="0" step="0.01" value="5" style="width:70px" /> Ah
+  OVP+α <input type="number" id="batAlpha" min="0" max="5" step="0.1" value="0.5" style="width:60px" /> V
+</div>
+<div class="row">
+  <button id="batStart">充電開始</button>
+  <button id="batStop">停止</button>
+  <span id="batState">停止中</span>
+</div>
+<div id="batMeter">-- Ah / -- Wh / -- 経過</div>
+</fieldset>
+
+<fieldset><legend>シーケンス（M4・ホスト側、条件分岐なし）</legend>
+<div class="row">
+  V <input type="number" id="sqV" min="0" max="60" step="0.01" value="12" style="width:70px" />
+  A <input type="number" id="sqA" min="0" max="10" step="0.01" value="1" style="width:70px" />
+  秒 <input type="number" id="sqD" min="1" value="60" style="width:70px" />
+  <button id="sqAdd">行追加</button>
+  ループ <input type="number" id="sqLoop" min="1" value="1" style="width:60px" />
+  終了後 <select id="sqEnd"><option value="off">OFF</option><option value="hold">維持</option></select>
+</div>
+<div id="sqList"></div>
+<div class="row">
+  <button id="sqStart">開始</button>
+  <button id="sqStop">停止</button>
+  <span id="sqState">停止中</span>
+</div>
+<div id="sqProg"></div>
+</fieldset>
+
+<fieldset><legend>電圧フィードバック補正（M1補足・数mV対策）</legend>
+<div class="row">
+  <label><input type="checkbox" id="fbEn" /> 有効</label>
+  目標 <input type="number" id="fbTarget" step="0.01" value="8.40" /> V
+  許容差 <input type="number" id="fbTol" step="1" value="5" /> mV
+  <span id="fbState">停止中</span>
+  <span id="fbDelta"></span>
+</div>
+<div style="font-size:12px;color:#555">出力ON中のみ動作。±5mV残差・CC/負荷急変の追従遅れは仕様。Vset分解能10mV。</div>
+</fieldset>
+
+<fieldset><legend>デバッグ</legend>
 <div class="row">
   <button data-q="VOLT?">VOLT?</button>
   <button data-q="CURR?">CURR?</button>
@@ -26,30 +144,474 @@
   <button data-q="OUTP?">OUTP?</button>
 </div>
 <div id="log"></div>
+</fieldset>
+
 <script>
-const log = (m) => { document.getElementById('log').textContent += m + "\n"; };
+const $ = (id) => document.getElementById(id);
+const log = (m) => { const el = $('log'); el.textContent += m + "\n"; el.scrollTop = el.scrollHeight; };
 const invoke = (...a) => window.__TAURI__.core.invoke(...a);
+const port = () => $('ports').value;
+let miss = 0, fbStable = 0, fbBase = null;
+
 async function refreshPorts() {
-  const sel = document.getElementById('ports');
-  sel.innerHTML = "";
+  const sel = $('ports'); sel.innerHTML = "";
   try {
     const ports = await invoke('list_serial_ports');
     ports.forEach(p => { const o = document.createElement('option'); o.value = o.textContent = p; sel.appendChild(o); });
     if (!ports.length) log("(ポートなし)");
   } catch (e) { log("list_serial_ports失敗: " + e); }
 }
-document.getElementById('refresh').onclick = refreshPorts;
-document.getElementById('connect').onclick = async () => {
-  const port = document.getElementById('ports').value;
-  try { log("*IDN? -> " + await invoke('psu_query', { port, cmd: "*IDN?", timeoutMs: 1500 })); }
-  catch (e) { log("失敗: " + e); }
+$('refresh').onclick = refreshPorts;
+
+$('scan').onclick = async () => {
+  try {
+    const hit = await invoke('psu_scan', { timeoutMs: 1200 });
+    await refreshPorts();
+    $('ports').value = hit.port;
+    $('conn').textContent = "接続: " + hit.port + " " + hit.idn;
+    $('pollEn').checked = true;
+    log("発見: " + hit.port + " " + hit.idn);
+  } catch (e) { log("スキャン失敗: " + e); }
 };
+
+$('apply').onclick = async () => {
+  const v = parseFloat($('vset').value), a = parseFloat($('aset').value);
+  if (!(v >= 0 && v <= 60)) { $('applyMsg').textContent = "V範囲外(0-60)"; return; }
+  if (!(a >= 0 && a <= 10)) { $('applyMsg').textContent = "A範囲外(0-10)"; return; }
+  if (v * a > 300) { $('applyMsg').textContent = "電力超過(>300W)"; return; }
+  try {
+    const r = await invoke('psu_apply', { port: port(), volt: v, curr: a, timeoutMs: 1500 });
+    $('applyMsg').textContent = "読戻し V=" + r.volt + " A=" + r.curr;
+    log("適用 V=" + r.volt + " A=" + r.curr);
+  } catch (e) { $('applyMsg').textContent = "失敗"; log("適用失敗: " + e); }
+};
+
+$('onBtn').onclick = async () => {
+  if (!confirm("出力をONにしますか？（負荷・配線を確認）")) return;
+  try { log("OUTP -> " + await invoke('psu_outp', { port: port(), on: true, timeoutMs: 1500 })); }
+  catch (e) { log("ON失敗: " + e); }
+};
+$('offBtn').onclick = async () => {
+  try { log("OUTP -> " + await invoke('psu_outp', { port: port(), on: false, timeoutMs: 1500 })); }
+  catch (e) { log("OFF失敗: " + e); }
+};
+
 document.querySelectorAll('[data-q]').forEach(b => b.onclick = async () => {
-  const port = document.getElementById('ports').value;
-  try { log(b.dataset.q + " -> " + await invoke('psu_query', { port, cmd: b.dataset.q, timeoutMs: 1500 })); }
+  try { log(b.dataset.q + " -> " + await invoke('psu_query', { port: port(), cmd: b.dataset.q, timeoutMs: 1500 })); }
   catch (e) { log("失敗: " + e); }
 });
+
+$('fbEn').onchange = () => {
+  fbStable = 0;
+  if ($('fbEn').checked) {
+    if (!$('fbTarget').value) $('fbTarget').value = $('vset').value;
+    fbBase = parseFloat($('vset').value);
+    $('fbState').textContent = "追込中";
+    log("FB開始 目標=" + $('fbTarget').value + "V 許容±" + $('fbTol').value + "mV");
+  } else { $('fbState').textContent = "停止中"; $('fbDelta').textContent = ""; fbBase = null; }
+};
+
+function decodeMode(s, outp) {
+  // INFO: V,I,P,OVP,OCP,OTP,flag
+  const f = (s || "").split(",");
+  const flags = f.slice(3, 6).map(x => (x || "").trim().toUpperCase());
+  const flag = (f[6] || "").trim();
+  if (flags.some(x => x !== "OFF" && x !== "")) return { t: "故障", bad: true, flags };
+  if ((outp || "").trim().toUpperCase() !== "ON" || flag === "0") return { t: "待機", bad: false, flags };
+  const iset = parseFloat($('aset').value), imeas = parseFloat(f[1]);
+  if (!isNaN(iset) && !isNaN(imeas) && iset > 0 && imeas >= iset - 0.005) return { t: "CC", bad: false, flags };
+  return { t: "CV", bad: false, flags };
+}
+
+async function fbStep(s) {
+  if (!$('fbEn').checked) return;
+  const m = decodeMode(s.info, s.outp);
+  if (m.bad || m.t !== "CV" && m.t !== "CC") {
+    if (m.bad) { $('fbEn').checked = false; $('fbState').textContent = "故障のため停止"; log("FB停止: 故障 " + s.info); }
+    else $('fbState').textContent = "休止中（出力OFF/待機）";
+    return;
+  }
+  if ((s.outp || "").trim().toUpperCase() !== "ON") { $('fbState').textContent = "休止中（出力OFF）"; return; }
+  const meas = parseFloat(s.meas_volt), vset = parseFloat(s.set_volt), iset = parseFloat(s.set_curr);
+  const target = parseFloat($('fbTarget').value), tolV = parseFloat($('fbTol').value) / 1000;
+  const limV = parseFloat(s.lim_volt);
+  if ([meas, vset, iset, target, tolV].some(isNaN)) return;
+  const err = target - meas;
+  if (Math.abs(err) <= tolV) {
+    fbStable++;
+    $('fbDelta').textContent = "Δ" + (err * 1000).toFixed(1) + "mV";
+    $('fbState').textContent = fbStable >= 3 ? "ホールド" : "追込中";
+    return;
+  }
+  fbStable = 0;
+  const step = Math.max(-0.02, Math.min(0.02, err));
+  const nv = Math.round((vset + step) * 100) / 100;
+  if (!(nv >= 0 && nv <= 60)) { $('fbEn').checked = false; $('fbState').textContent = "範囲外のため停止"; return; }
+  if (nv * iset > 300 || (!isNaN(limV) && nv > limV)) { $('fbEn').checked = false; $('fbState').textContent = "上限超過のため停止"; log("FB停止: 電力/OVP上限"); return; }
+  if (fbBase !== null && Math.abs(nv - fbBase) > 0.1001) { $('fbEn').checked = false; $('fbState').textContent = "補正量超過(±100mV)のため停止"; log("FB停止: 補正量超過"); return; }
+  try {
+    const r = await invoke('psu_apply', { port: port(), volt: nv, curr: iset, timeoutMs: 1500 });
+    $('vset').value = nv.toFixed(2);
+    $('fbDelta').textContent = "Δ" + (err * 1000).toFixed(1) + "mV → Vset=" + r.volt;
+    $('fbState').textContent = "追込中";
+  } catch (e) { $('fbState').textContent = "補正失敗（休止）"; log("FB補正失敗: " + e); }
+}
+
+async function pollTick() {
+  if (!$('pollEn').checked || !port()) return;
+  try {
+    const s = await invoke('psu_poll', { port: port(), timeoutMs: 1200 });
+    miss = 0;
+    lastSnap = s; lastSnapT = Date.now(); pushSample(s, true);
+    $('meas').textContent = s.meas_volt + " V / " + s.meas_curr + " A / " + s.meas_pow + " W";
+    const m = decodeMode(s.info, s.outp);
+    $('mode').textContent = m.t + "（設定 " + s.set_volt + "V/" + s.set_curr + "A・出力" + s.outp + "）";
+    $('mode').style.color = m.bad ? "red" : "black";
+    const b = $('banner');
+    if (m.bad) { b.style.display = "block"; b.textContent = "故障: " + s.info; }
+    else b.style.display = "none";
+    $('prot').textContent = "OVP " + s.lim_volt + "V / OCP " + s.lim_curr + "A（" + s.info.split(",").slice(3, 6).join("/") + "）";
+    await fbStep(s);
+    await batTick(s);
+    await seqTick(s);
+  } catch (e) {
+    miss++;
+    pushSample(null, false); // 欠損扱い：線を繋がない、ログにも書かない
+    log("poll失敗(" + miss + "): " + e);
+    if (miss >= 3) { $('pollEn').checked = false; $('fbState').textContent = "休止中（無応答）"; log("自動一時停止: PSU無応答"); }
+  }
+}
+setInterval(pollTick, 1000);
+
+/* ---- M3: プリセット ---- */
+async function refreshPs() {
+  const q = ($('psSearch').value || "").toLowerCase();
+  try {
+    const ps = await invoke('preset_list');
+    const el = $('psList'); el.innerHTML = "";
+    ps.filter(p => (p.name + " " + (p.note || "")).toLowerCase().includes(q)).forEach(p => {
+      const row = document.createElement('div'); row.className = "row";
+      row.textContent = p.name + " (" + p.volt + "V/" + p.curr + "A" + (p.ovp != null ? " OVP" + p.ovp : "") + (p.note ? " " + p.note : "") + ") ";
+      const ap = document.createElement('button'); ap.textContent = "適用";
+      ap.onclick = async () => {
+        try {
+          if (p.ovp != null || p.ocp != null) {
+            const r = await invoke('psu_protect', { port: port(), ovp: p.ovp != null ? p.ovp : parseFloat(lastSnap.lim_volt), ocp: p.ocp != null ? p.ocp : parseFloat(lastSnap.lim_curr), timeoutMs: 1500 });
+            log("保護適用 OVP=" + r.ovp + " OCP=" + r.ocp);
+          }
+          const r2 = await invoke('psu_apply', { port: port(), volt: p.volt, curr: p.curr, timeoutMs: 1500 });
+          $('vset').value = p.volt.toFixed(2); $('aset').value = p.curr.toFixed(3);
+          log("プリセット適用: " + p.name + " V=" + r2.volt + " A=" + r2.curr);
+        } catch (e) { log("プリセット適用失敗: " + e); }
+      };
+      const del = document.createElement('button'); del.textContent = "削除";
+      del.onclick = async () => { if (!confirm("削除しますか: " + p.name)) return; try { await invoke('preset_delete', { id: p.id }); refreshPs(); } catch (e) { log("削除失敗: " + e); } };
+      row.appendChild(ap); row.appendChild(del); el.appendChild(row);
+    });
+    if (!el.children.length) el.textContent = "(なし)";
+  } catch (e) { log("preset_list失敗: " + e); }
+}
+$('psSearch').oninput = refreshPs;
+$('psSave').onclick = async () => {
+  const name = prompt("プリセット名:");
+  if (!name) return;
+  const note = prompt("メモ（任意）:", "") || "";
+  try {
+    await invoke('preset_save', { p: { id: Date.now().toString(36), name, volt: parseFloat($('vset').value), curr: parseFloat($('aset').value), ovp: lastSnap ? parseFloat(lastSnap.lim_volt) : null, ocp: lastSnap ? parseFloat(lastSnap.lim_curr) : null, note, updated: new Date().toISOString() } });
+    refreshPs(); log("プリセット保存: " + name);
+  } catch (e) { log("保存失敗: " + e); }
+};
+$('psExport').onclick = async () => {
+  try {
+    const ps = await invoke('preset_list');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(ps, null, 2)], { type: 'application/json' }));
+    a.download = "spe6103_presets.json"; a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { log("書出失敗: " + e); }
+};
+$('psImport').onchange = async (ev) => {
+  const f = ev.target.files[0]; if (!f) return;
+  try {
+    const text = await f.text();
+    const ps = await invoke('preset_import', { json: text });
+    refreshPs(); log("読込: " + ps.length + "件");
+  } catch (e) { log("読込失敗: " + e); }
+  ev.target.value = "";
+};
+
+/* ---- M3: バッテリーMode ---- */
+const bat = { active: false, t0: 0, lastT: 0, ah: 0, wh: 0, armed: false, saved: null, ownLog: false, iterm: 0, tmax: 0, ahmax: 0 };
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.35].forEach(d => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value = 880; o.start(ctx.currentTime + d); o.stop(ctx.currentTime + d + 0.3);
+    });
+  } catch (e) { /* 音が出なくても継続 */ }
+}
+async function notifyEnd(title, body) {
+  try { await invoke('plugin:notification|notify', { options: { title, body } }); }
+  catch (e) { log("OS通知失敗(ダイアログで代替): " + e); }
+  beep();
+  alert(title + "\n" + body);
+}
+$('batAutoV').onclick = () => {
+  if ($('batChem').value === "lipo") $('batV').value = (4.2 * parseInt($('batCells').value || "1", 10)).toFixed(2);
+};
+$('batStart').onclick = async () => {
+  if (bat.active) return;
+  if (seq.active) { alert("シーケンス実行中のため開始できません"); return; }
+  const v = parseFloat($('batV').value), a = parseFloat($('batA').value);
+  const iterm = parseFloat($('batIterm').value), tmax = parseFloat($('batTmax').value) * 60, ahmax = parseFloat($('batAhmax').value);
+  const alpha = parseFloat($('batAlpha').value);
+  const ovp = Math.round((v + alpha) * 1000) / 1000, ocp = Math.min(10, Math.round((a + 0.2) * 1000) / 1000);
+  if (!(v > 0 && v <= 60) || !(a > 0 && a <= 10)) { alert("V/A範囲外"); return; }
+  if (v * a > 300) { alert("電力超過(>300W)"); return; }
+  if (ovp > 60 || ocp > 10) { alert("保護値が範囲外"); return; }
+  if (!(iterm >= 0) || !(tmax > 0) || !(ahmax > 0)) { alert("終了条件が不正"); return; }
+  if (!confirm("充電を開始しますか？\n温度保護なし・BMS必須・無人禁止。\nVset=" + v + "V Ilim=" + a + "A OVP=" + ovp + "V")) return;
+  try {
+    bat.saved = { v: parseFloat($('vset').value), a: parseFloat($('aset').value), ovp: lastSnap ? parseFloat(lastSnap.lim_volt) : null, ocp: lastSnap ? parseFloat(lastSnap.lim_curr) : null };
+    const rp = await invoke('psu_protect', { port: port(), ovp, ocp, timeoutMs: 1500 });
+    log("充電用保護 OVP=" + rp.ovp + " OCP=" + rp.ocp);
+    const ra = await invoke('psu_apply', { port: port(), volt: v, curr: a, timeoutMs: 1500 });
+    $('vset').value = v.toFixed(2); $('aset').value = a.toFixed(3);
+    log("充電設定 V=" + ra.volt + " A=" + ra.curr);
+    await invoke('psu_outp', { port: port(), on: true, timeoutMs: 1500 });
+    if ($('fbEn').checked) { $('fbEn').checked = false; $('fbState').textContent = "停止中（充電優先）"; }
+    if (!logging) {
+      const path = await invoke('log_start', { name: "spe6103_charge_" + stamp(new Date()) + ".csv" });
+      logging = true; lastLog = 0; bat.ownLog = true;
+      $('logBtn').textContent = "ログ停止"; $('logState').textContent = "記録中(充電強制): " + path;
+    } else bat.ownLog = false;
+    Object.assign(bat, { active: true, t0: Date.now(), lastT: Date.now(), ah: 0, wh: 0, armed: false, iterm, tmax, ahmax });
+    $('batState').textContent = "充電中";
+    log("充電開始 Vset=" + v + " Ilim=" + a);
+  } catch (e) { log("充電開始失敗: " + e); }
+};
+async function endBattery(reason, auto) {
+  if (!bat.active) return;
+  bat.active = false;
+  $('batState').textContent = "終了処理中...";
+  const msg = reason + "（" + bat.ah.toFixed(3) + "Ah/" + bat.wh.toFixed(3) + "Wh/" + Math.round((Date.now() - bat.t0) / 60000) + "分）";
+  try {
+    await invoke('psu_outp', { port: port(), on: false, timeoutMs: 1500 });
+    if (bat.saved && bat.saved.ovp != null) {
+      const rp = await invoke('psu_protect', { port: port(), ovp: bat.saved.ovp, ocp: bat.saved.ocp, timeoutMs: 1500 });
+      log("保護値を復元 OVP=" + rp.ovp + " OCP=" + rp.ocp);
+    }
+    if (bat.ownLog && logging) {
+      const done = await invoke('log_stop');
+      logging = false; bat.ownLog = false;
+      $('logBtn').textContent = "ログ開始"; $('logState').textContent = "停止中";
+      log("充電ログ確定: " + done);
+    }
+  } catch (e) { log("終了処理失敗: " + e); }
+  $('batState').textContent = "停止中";
+  $('batMeter').textContent = bat.ah.toFixed(3) + " Ah / " + bat.wh.toFixed(3) + " Wh（" + msg + "）";
+  log("充電終了: " + msg);
+  if (auto) notifyEnd("SPE6103 充電終了", msg);
+}
+$('batStop').onclick = () => endBattery("手動停止", false);
+async function batTick(s) {
+  if (!bat.active) return;
+  if (Date.now() - lastSnapT > 2500) return;
+  const m = decodeMode(s.info, s.outp);
+  const now = Date.now(), dt = (now - bat.lastT) / 1000; bat.lastT = now;
+  const iv = parseFloat(s.meas_curr), vv = parseFloat(s.meas_volt);
+  if (!isNaN(iv) && !isNaN(vv) && dt > 0 && dt < 10) { bat.ah += iv * dt / 3600; bat.wh += vv * iv * dt / 3600; }
+  if (!isNaN(iv) && iv >= bat.iterm) bat.armed = true;
+  $('batMeter').textContent = bat.ah.toFixed(3) + " Ah / " + bat.wh.toFixed(3) + " Wh / " + Math.round((now - bat.t0) / 60000) + "分経過";
+  if (m.bad) { endBattery("故障検出", true); return; }
+  if (bat.armed && !isNaN(iv) && iv <= bat.iterm) { endBattery("終止電流到達", true); return; }
+  if ((now - bat.t0) / 1000 >= bat.tmax) { endBattery("最大時間到達", true); return; }
+  if (bat.ah >= bat.ahmax) { endBattery("最大容量到達", true); return; }
+}
+
+/* ---- M2: グラフ（リングバッファ＋描画分離） ---- */
+const MAXP = 7200; // 1s周期で2時間
+const buf = []; // {t,v,a,w,ok}
+function pushSample(s, ok) {
+  if (ok) buf.push({ t: Date.now(), v: parseFloat(s.meas_volt), a: parseFloat(s.meas_curr), w: parseFloat(s.meas_pow), ok: true });
+  else buf.push({ t: Date.now(), v: NaN, a: NaN, w: NaN, ok: false });
+  if (buf.length > MAXP) buf.splice(0, buf.length - MAXP);
+}
+$('gClear').onclick = () => { buf.length = 0; };
+const SERIES = [
+  { key: 'v', box: 'gV', color: '#d62728', unit: 'V' },
+  { key: 'a', box: 'gA', color: '#1f77b4', unit: 'A' },
+  { key: 'w', box: 'gW', color: '#2ca02c', unit: 'W' },
+];
+let lastDraw = 0;
+function drawGraph(now) {
+  requestAnimationFrame(drawGraph);
+  if (now - lastDraw < 250) return; // 描画は4fpsに間引き
+  lastDraw = now;
+  const cv = $('graph'), ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = '#eee';
+  for (let i = 1; i < 4; i++) { ctx.beginPath(); ctx.moveTo(0, H * i / 4); ctx.lineTo(W, H * i / 4); ctx.stroke(); }
+  const vis = SERIES.filter(s => $(s.box).checked);
+  if (buf.length < 2 || !vis.length) return;
+  const stride = Math.max(1, Math.ceil(buf.length / W)); // 間引き
+  const info = [];
+  for (const s of vis) {
+    let mn = Infinity, mx = -Infinity;
+    for (let i = 0; i < buf.length; i += stride) {
+      const p = buf[i]; if (!p.ok || isNaN(p[s.key])) continue;
+      if (p[s.key] < mn) mn = p[s.key]; if (p[s.key] > mx) mx = p[s.key];
+    }
+    if (!isFinite(mn)) continue;
+    if (mx - mn < 1e-9) { mn -= 0.5; mx += 0.5; }
+    const pad = (mx - mn) * 0.1; mn -= pad; mx += pad;
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < buf.length; i += stride) {
+      const p = buf[i];
+      if (!p.ok || isNaN(p[s.key])) { pen = false; continue; } // 欠損で線を切る
+      const x = i / (buf.length - 1) * W, y = H - (p[s.key] - mn) / (mx - mn) * H;
+      if (!pen) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    info.push(s.key.toUpperCase() + ":" + mn.toFixed(2) + "-" + mx.toFixed(2) + s.unit);
+  }
+  $('gInfo').textContent = info.join(" / ");
+}
+requestAnimationFrame(drawGraph);
+
+/* ---- M4: シーケンス（ホスト側ステップ表） ---- */
+const seq = { active: false, steps: [], loop: 0, loopTotal: 1, idx: 0, stepEnd: 0, endOff: true, ownLog: false };
+function renderSq() {
+  const el = $('sqList'); el.innerHTML = "";
+  seq.steps.forEach((st, i) => {
+    const row = document.createElement('div'); row.className = "row";
+    row.textContent = (i + 1) + ": " + st.v + "V/" + st.a + "A × " + st.d + "s ";
+    const del = document.createElement('button'); del.textContent = "削除";
+    del.onclick = () => { if (!seq.active) { seq.steps.splice(i, 1); renderSq(); } };
+    row.appendChild(del); el.appendChild(row);
+  });
+  if (!seq.steps.length) el.textContent = "(ステップなし)";
+}
+$('sqAdd').onclick = () => {
+  if (seq.active) return;
+  const v = parseFloat($('sqV').value), a = parseFloat($('sqA').value), d = parseInt($('sqD').value, 10);
+  if (!(v >= 0 && v <= 60) || !(a >= 0 && a <= 10)) { alert("V/A範囲外（本体最大のみ）"); return; }
+  if (v * a > 300) { alert("電力超過(>300W)"); return; }
+  if (!(d >= 1)) { alert("継続時間が不正"); return; }
+  seq.steps.push({ v, a, d }); renderSq();
+};
+async function seqApplyStep() {
+  const st = seq.steps[seq.idx];
+  await invoke('psu_apply', { port: port(), volt: st.v, curr: st.a, timeoutMs: 1500 });
+  await invoke('psu_outp', { port: port(), on: true, timeoutMs: 1500 });
+  $('vset').value = st.v.toFixed(2); $('aset').value = st.a.toFixed(3);
+  seq.stepEnd = Date.now() + st.d * 1000;
+  log("SEQ step " + (seq.idx + 1) + "/" + seq.steps.length + " V=" + st.v + " A=" + st.a + " " + st.d + "s");
+}
+$('sqStart').onclick = async () => {
+  if (seq.active) return;
+  if (bat.active) { alert("充電実行中のため開始できません"); return; }
+  if (!seq.steps.length) { alert("ステップがありません"); return; }
+  const loop = parseInt($('sqLoop').value, 10);
+  if (!(loop >= 1)) { alert("ループ回数が不正"); return; }
+  if (!confirm("シーケンスを開始しますか？（" + seq.steps.length + "ステップ×" + loop + "ループ）")) return;
+  try {
+    if ($('fbEn').checked) { $('fbEn').checked = false; $('fbState').textContent = "停止中（シーケンス優先）"; }
+    if (!logging) {
+      const path = await invoke('log_start', { name: "spe6103_seq_" + stamp(new Date()) + ".csv" });
+      logging = true; lastLog = 0; seq.ownLog = true;
+      $('logBtn').textContent = "ログ停止"; $('logState').textContent = "記録中(シーケンス): " + path;
+    } else seq.ownLog = false;
+    Object.assign(seq, { active: true, loop: 0, loopTotal: loop, idx: 0, endOff: $('sqEnd').value === "off" });
+    await seqApplyStep();
+    $('sqState').textContent = "実行中";
+  } catch (e) { log("シーケンス開始失敗: " + e); }
+};
+async function finishSeq(reason, auto) {
+  if (!seq.active) return;
+  seq.active = false;
+  $('sqState').textContent = "終了処理中...";
+  try {
+    if (auto ? seq.endOff : true) await invoke('psu_outp', { port: port(), on: false, timeoutMs: 1500 });
+    if (seq.ownLog && logging) {
+      const done = await invoke('log_stop');
+      logging = false; seq.ownLog = false;
+      $('logBtn').textContent = "ログ開始"; $('logState').textContent = "停止中";
+      log("シーケンスログ確定: " + done);
+    }
+  } catch (e) { log("終了処理失敗: " + e); }
+  $('sqState').textContent = "停止中";
+  $('sqProg').textContent = reason;
+  log("シーケンス終了: " + reason);
+  if (auto) notifyEnd("SPE6103 シーケンス終了", reason);
+}
+$('sqStop').onclick = () => finishSeq("手動停止", false);
+async function seqTick(s) {
+  if (!seq.active) return;
+  if (Date.now() - lastSnapT > 2500) return;
+  const m = decodeMode(s.info, s.outp);
+  if (m.bad) { finishSeq("故障検出のため停止", true); return; }
+  const now = Date.now();
+  const remain = Math.ceil((seq.stepEnd - now) / 1000);
+  if (remain > 0) {
+    $('sqProg').textContent = "ループ" + (seq.loop + 1) + "/" + seq.loopTotal + "・step " + (seq.idx + 1) + "/" + seq.steps.length + "・残り" + remain + "s";
+    return;
+  }
+  try {
+    seq.idx++;
+    if (seq.idx >= seq.steps.length) {
+      seq.loop++;
+      if (seq.loop >= seq.loopTotal) { finishSeq("全ステップ完了（ループ" + seq.loopTotal + "回）", true); return; }
+      seq.idx = 0;
+    }
+    await seqApplyStep();
+  } catch (e) { finishSeq("設定失敗のため停止: " + e, true); }
+}
+renderSq();
+let logging = false, lastLog = 0, lastSnap = null, lastSnapT = 0;
+const stamp = (d) => {
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+};
+$('logBtn').onclick = async () => {
+  try {
+    if (!logging) {
+      const name = "spe6103_" + stamp(new Date()) + ".csv";
+      const path = await invoke('log_start', { name });
+      logging = true; lastLog = 0;
+      $('logBtn').textContent = "ログ停止";
+      $('logState').textContent = "記録中: " + path;
+      log("ログ開始: " + path);
+    } else {
+      const done = await invoke('log_stop');
+      logging = false;
+      $('logBtn').textContent = "ログ開始";
+      $('logState').textContent = "停止中";
+      log("ログ確定: " + done);
+    }
+  } catch (e) { log("ログ操作失敗: " + e); }
+};
+setInterval(async () => {
+  if (!logging || !lastSnap) return;
+  const iv = parseInt($('logIv').value, 10);
+  if (Date.now() - lastLog < iv) return;
+  if (Date.now() - lastSnapT > 2500) return; // 無応答時は空行を書かない
+  const s = lastSnap;
+  const line = [new Date().toISOString(), s.set_volt, s.meas_volt, s.set_curr, s.meas_curr, s.meas_pow,
+    decodeMode(s.info, s.outp).t, s.outp, '"' + s.info + '"'].join(",");
+  try {
+    const st = await invoke('log_append', { line });
+    lastLog = Date.now();
+    $('logState').textContent = "記録中: " + st.path + " (" + st.lines + "行" + (st.rotated ? "・ローテーション" : "") + ")";
+  } catch (e) { log("ログ追記失敗: " + e); }
+}, 500);
+
 refreshPorts();
+refreshPs();
 </script>
 </body>
 </html>

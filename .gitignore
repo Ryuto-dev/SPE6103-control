@@ -5,3 +5,12 @@ __pycache__/
 *.pyc
 target/
 /app/src-tauri/target/
+# Deps / local data
+node_modules/
+app/node_modules/
+logs/
+app/src-tauri/logs/
+presets.json
+app/presets.json
+app/src-tauri/presets.json
+.DS_Store
