@@ -13,6 +13,7 @@
   #banner { display: none; background: #c00; color: #fff; padding: 8px; font-weight: bold; }
   #graph { width: 100%; height: 220px; background: #fff; border: 1px solid #ccc; }
   .lgV { color: #d62728; font-weight: bold; } .lgA { color: #1f77b4; font-weight: bold; } .lgW { color: #2ca02c; font-weight: bold; }
+  #svQr svg { width: 200px; height: 200px; }
   button { padding: 6px 12px; }
   input[type=number] { width: 90px; }
   fieldset { margin: 12px 0; }
@@ -122,6 +123,20 @@
   <span id="sqState">停止中</span>
 </div>
 <div id="sqProg"></div>
+</fieldset>
+
+<fieldset><legend>サーバーモード（M5・LAN内のみ）</legend>
+<div style="font-size:12px">スマホをグラフ・遠隔端末に。WAN公開は非推奨（README参照）。権限はサーバー側で固定（クライアント側で緩和不可）。</div>
+<div class="row">
+  ポート <input type="number" id="svPort" value="8000" style="width:80px" />
+  権限 <select id="svLevel"><option value="0">Lv0 監視のみ</option><option value="1" selected>Lv1 監視＋出力OFF</option><option value="2">Lv2 フル操作</option></select>
+  <label id="svLv2w" style="display:none;color:#a00"><input type="checkbox" id="svLv2ok" /> フル操作を理解して有効化（トークン必須）</label>
+  <button id="svStart">開始</button>
+  <button id="svStop">停止</button>
+</div>
+<div id="svInfo">停止中</div>
+<div id="svQr"></div>
+<div id="svOps"></div>
 </fieldset>
 
 <fieldset><legend>電圧フィードバック補正（M1補足・数mV対策）</legend>
@@ -430,6 +445,44 @@ async function batTick(s) {
   if ((now - bat.t0) / 1000 >= bat.tmax) { endBattery("最大時間到達", true); return; }
   if (bat.ah >= bat.ahmax) { endBattery("最大容量到達", true); return; }
 }
+
+/* ---- M5: サーバーモード ---- */
+let svRunning = false;
+$('svLevel').onchange = () => { $('svLv2w').style.display = $('svLevel').value === '2' ? 'inline' : 'none'; };
+$('svStart').onclick = async () => {
+  const level = parseInt($('svLevel').value, 10);
+  if (level === 2 && !$('svLv2ok').checked) { alert("Lv2には明示的な有効化が必要です"); return; }
+  if (!port()) { alert("先にポートを選択/スキャンしてください"); return; }
+  if (!confirm("サーバーを開始しますか？ LAN内公開・Lv" + level + "（WAN公開は非推奨）")) return;
+  try {
+    const r = await invoke('server_start', { port: parseInt($('svPort').value, 10), level, allowLv2: $('svLv2ok').checked, device: port() });
+    svRunning = true;
+    $('svInfo').innerHTML = "";
+    $('svInfo').appendChild(document.createTextNode("公開中: "));
+    const a = document.createElement('a'); a.href = a.textContent = r.url; a.target = "_blank";
+    $('svInfo').appendChild(a);
+    if (r.token) { const d = document.createElement('div'); d.textContent = "トークン: " + r.token; $('svInfo').appendChild(d); }
+    const l = document.createElement('div'); l.textContent = "ログ: " + r.log; $('svInfo').appendChild(l);
+    $('svQr').innerHTML = r.qr;
+    log("サーバー開始: " + r.url);
+  } catch (e) { log("サーバー開始失敗: " + e); }
+};
+$('svStop').onclick = async () => {
+  try {
+    const r = await invoke('server_stop');
+    svRunning = false;
+    $('svInfo').textContent = "停止中"; $('svQr').innerHTML = ""; $('svOps').textContent = "";
+    log("サーバー停止: " + r);
+  } catch (e) { log("停止失敗: " + e); }
+};
+setInterval(async () => {
+  if (!svRunning) return;
+  try {
+    const s = await invoke('server_status');
+    $('svOps').textContent = "ops: " + s.ops + " " + s.url;
+    if (!s.running) { svRunning = false; $('svInfo').textContent = "停止中"; }
+  } catch (e) { /* 表示のみ */ }
+}, 5000);
 
 /* ---- M2: グラフ（リングバッファ＋描画分離） ---- */
 const MAXP = 7200; // 1s周期で2時間

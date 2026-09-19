@@ -289,14 +289,8 @@ fn psu_query(port: String, cmd: String, timeout_ms: Option<u64>) -> Result<Strin
     query(&mut p, &cmd, timeout)
 }
 
-/// 設定V/Aの適用. 送信前ブロック (60V/10A/300W) + `*IDN?` ガード + 読戻し確認.
-#[tauri::command]
-fn psu_apply(
-    port: String,
-    volt: f64,
-    curr: f64,
-    timeout_ms: Option<u64>,
-) -> Result<ApplyResult, String> {
+/// V/A範囲＋電力の送信前ブロック (M1/M4/M5共通).
+fn check_va(volt: f64, curr: f64) -> Result<(), String> {
     if !(0.0..=V_MAX).contains(&volt) {
         return Err(format!("V範囲外: {volt} (0-{V_MAX}V)"));
     }
@@ -309,8 +303,12 @@ fn psu_apply(
             volt * curr
         ));
     }
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(1500));
-    let mut p = open_port(&port)?;
+    Ok(())
+}
+
+fn scpi_apply(port: &str, volt: f64, curr: f64, timeout: Duration) -> Result<ApplyResult, String> {
+    check_va(volt, curr)?;
+    let mut p = open_port(port)?;
     std::thread::sleep(Duration::from_millis(200));
     ensure_spe6103(&mut p, timeout)?;
     // 書込みコマンドは応答なし. 間隔をあけて順送.
@@ -327,11 +325,8 @@ fn psu_apply(
     Ok(ApplyResult { volt: rv, curr: ra })
 }
 
-/// 出力ON/OFF. `*IDN?` ガード + 読戻し確認.
-#[tauri::command]
-fn psu_outp(port: String, on: bool, timeout_ms: Option<u64>) -> Result<String, String> {
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(1500));
-    let mut p = open_port(&port)?;
+fn scpi_outp(port: &str, on: bool, timeout: Duration) -> Result<String, String> {
+    let mut p = open_port(port)?;
     std::thread::sleep(Duration::from_millis(200));
     ensure_spe6103(&mut p, timeout)?;
     let cmd = if on { "OUTP ON" } else { "OUTP OFF" };
@@ -340,6 +335,28 @@ fn psu_outp(port: String, on: bool, timeout_ms: Option<u64>) -> Result<String, S
     p.flush().map_err(|e| format!("flush: {e}"))?;
     std::thread::sleep(Duration::from_millis(300));
     query(&mut p, "OUTP?", timeout)
+}
+
+/// 設定V/Aの適用. 送信前ブロック (60V/10A/300W) + `*IDN?` ガード + 読戻し確認.
+#[tauri::command]
+fn psu_apply(
+    port: String,
+    volt: f64,
+    curr: f64,
+    timeout_ms: Option<u64>,
+) -> Result<ApplyResult, String> {
+    scpi_apply(
+        &port,
+        volt,
+        curr,
+        Duration::from_millis(timeout_ms.unwrap_or(1500)),
+    )
+}
+
+/// 出力ON/OFF. `*IDN?` ガード + 読戻し確認.
+#[tauri::command]
+fn psu_outp(port: String, on: bool, timeout_ms: Option<u64>) -> Result<String, String> {
+    scpi_outp(&port, on, Duration::from_millis(timeout_ms.unwrap_or(1500)))
 }
 
 /// OVP/OCP設定. 送信前ブロック (60V/10A) + `*IDN?` ガード + 読戻し確認 (M3).
@@ -481,6 +498,515 @@ fn psu_poll(port: String, timeout_ms: Option<u64>) -> Result<Snapshot, String> {
     })
 }
 
+/* ================= M5 サーバーモード (stdのみHTTP + qrcode) =================
+ * Lv0 監視のみ / Lv1 Lv0＋出力OFF(デフォルト) / Lv2 フル操作(要明示ON＋トークン)。
+ * 0.0.0.0 Bind (LAN内利用想定・WAN公開非推奨はREADME参照)。操作ログを残す。 */
+
+use std::collections::HashMap;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// LAN側IPの取得. UDP connectはパケットを送らない.
+fn lan_ip() -> String {
+    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if s.connect("8.8.8.8:80").is_ok() {
+            if let Ok(a) = s.local_addr() {
+                let ip = a.ip().to_string();
+                if !ip.starts_with("127.") {
+                    return ip;
+                }
+            }
+        }
+    }
+    "127.0.0.1".into()
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn make_token() -> String {
+    use std::hash::{Hash, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (t, std::process::id(), N.fetch_add(1, Ordering::Relaxed)).hash(&mut h);
+    format!("{:016x}{:016x}", h.finish(), (t & 0xffff_ffff_ffff_ffff) as u64)
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn device_snapshot_json(device: &str) -> Result<String, String> {
+    let timeout = Duration::from_millis(1200);
+    let mut p = open_port(device)?;
+    let mut g = |cmd: &str| query(&mut p, cmd, timeout);
+    let sv = g("VOLT?")?;
+    let sa = g("CURR?")?;
+    let lv = g("VOLT:LIM?")?;
+    let la = g("CURR:LIM?")?;
+    let mv = g("MEAS:VOLT?")?;
+    let ma = g("MEAS:CURR?")?;
+    let mp = g("MEAS:POW?")?;
+    let info = g("MEAS:ALL:INFO?")?;
+    let outp = g("OUTP?")?;
+    Ok(format!(
+        "{{\"set_volt\":\"{}\",\"set_curr\":\"{}\",\"lim_volt\":\"{}\",\"lim_curr\":\"{}\",\"meas_volt\":\"{}\",\"meas_curr\":\"{}\",\"meas_pow\":\"{}\",\"info\":\"{}\",\"outp\":\"{}\"}}",
+        escape_json(&sv),
+        escape_json(&sa),
+        escape_json(&lv),
+        escape_json(&la),
+        escape_json(&mv),
+        escape_json(&ma),
+        escape_json(&mp),
+        escape_json(&info),
+        escape_json(&outp)
+    ))
+}
+
+#[derive(Clone)]
+struct SrvCfg {
+    device: String,
+    level: u8,
+    token: String,
+    public: String,
+    log: std::path::PathBuf,
+    ops: std::sync::Arc<Mutex<u64>>,
+}
+
+fn ops_log(log: &std::path::Path, ops: &std::sync::Arc<Mutex<u64>>, who: &str, msg: &str) {
+    let line = format!("[{}] {} {}", epoch_secs(), who, msg);
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        use std::io::Write as _;
+        let mut f = f;
+        let _ = writeln!(f, "{line}");
+    }
+    if let Ok(mut n) = ops.lock() {
+        *n += 1;
+    }
+}
+
+fn http_resp(s: &mut TcpStream, code: u16, text: &str, ctype: &str, body: &str) {
+    let h = format!(
+        "HTTP/1.1 {code} {text}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = s.write_all(h.as_bytes());
+    let _ = s.write_all(body.as_bytes());
+}
+
+fn read_http(s: &TcpStream) -> Option<(String, String, HashMap<String, String>, Vec<u8>)> {
+    s.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    let mut s = s; // &TcpStream は Copy。Readにはmut束縛が必要
+    let mut buf: Vec<u8> = Vec::new();
+    let mut one = [0u8; 1];
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_secs(5) || buf.len() > 65536 {
+            return None;
+        }
+        match s.read(&mut one) {
+            Ok(1) => {
+                buf.push(one[0]);
+                if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => return None,
+        }
+    }
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let mut lines = head.split("\r\n");
+    let req = lines.next().unwrap_or("");
+    let mut sp = req.split_whitespace();
+    let method = sp.next().unwrap_or("").to_uppercase();
+    let target = sp.next().unwrap_or("/").to_string();
+    let mut headers = HashMap::new();
+    for l in lines {
+        if l.is_empty() {
+            break;
+        }
+        if let Some(i) = l.find(':') {
+            headers.insert(l[..i].trim().to_lowercase(), l[i + 1..].trim().to_string());
+        }
+    }
+    // &TcpStream に対する read は共有参照でよい (Read for &TcpStream).
+    let len: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; len.min(65536)];
+    let mut got = 0;
+    while got < body.len() {
+        match s.read(&mut body[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if start.elapsed() > Duration::from_secs(5) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    body.truncate(got);
+    Some((method, target, headers, body))
+}
+
+fn authed(target: &str, headers: &HashMap<String, String>, token: &str) -> bool {
+    if headers.get("x-token").map(|v| v == token).unwrap_or(false) {
+        return true;
+    }
+    if let Some(q) = target.split_once('?').map(|(_, q)| q) {
+        for kv in q.split('&') {
+            if let Some(v) = kv.strip_prefix("token=") {
+                if v == token {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+const DASH: &str = r##"<!doctype html><html lang="ja"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SPE6103 Lv%%LEVEL%%</title>
+<style>body{font-family:system-ui,sans-serif;margin:16px}#v{font-size:40px;font-weight:bold}#mode{font-size:24px}button{padding:10px 16px;margin:4px}input{width:90px;padding:8px}</style>
+</head><body><h2>SPE6103 サーバー (Lv%%LEVEL%%)</h2>
+<div id="v">-- V / -- A / -- W</div><div id="mode">--</div><div id="op"></div>
+<div>%%CTLS%%</div>
+<script>
+const tok = new URLSearchParams(location.search).get('token') || '';
+async function st(){
+  try{
+    const r = await fetch('/api/status'); const s = await r.json();
+    document.getElementById('v').textContent = s.meas_volt + ' V / ' + s.meas_curr + ' A / ' + s.meas_pow + ' W';
+    document.getElementById('mode').textContent = s.info + ' / ' + s.outp + ' (設定' + s.set_volt + 'V/' + s.set_curr + 'A)';
+  }catch(e){ document.getElementById('mode').textContent = '無応答'; }
+}
+async function post(path, body){
+  const q = tok ? '?token=' + encodeURIComponent(tok) : '';
+  const r = await fetch(path + q, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Token': tok }, body: JSON.stringify(body) });
+  document.getElementById('op').textContent = r.status + ' ' + (await r.text());
+  st();
+}
+setInterval(st, 2000); st();
+</script></body></html>"##;
+
+fn controls_html(level: u8) -> &'static str {
+    match level {
+        0 => "<p>監視のみ</p>",
+        1 => "<button onclick=\"post('/api/outp',{on:false})\">出力OFF</button>",
+        _ => "<button onclick=\"post('/api/outp',{on:true})\">出力ON</button><button onclick=\"post('/api/outp',{on:false})\">出力OFF</button><br />V <input id=\"v\" type=\"number\" step=\"0.01\" /> A <input id=\"a\" type=\"number\" step=\"0.001\" /><button onclick=\"post('/api/apply',{volt:parseFloat(document.getElementById('v').value),curr:parseFloat(document.getElementById('a').value)})\">適用</button>",
+    }
+}
+
+fn qr_svg(url: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(url).map_err(|e| format!("qr: {e}"))?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .build())
+}
+
+fn handle_client(stream: TcpStream, cfg: &SrvCfg) {
+    let who = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".into());
+    let mut s = stream;
+    let Some((method, target, headers, body)) = read_http(&s) else {
+        return;
+    };
+    let (path, _q) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target.as_str(), ""),
+    };
+    match (method.as_str(), path) {
+        ("GET", "/") | ("GET", "/index.html") => {
+            let html = DASH
+                .replace("%%LEVEL%%", &cfg.level.to_string())
+                .replace("%%CTLS%%", controls_html(cfg.level));
+            http_resp(&mut s, 200, "OK", "text/html; charset=utf-8", &html);
+        }
+        ("GET", "/qr") => match qr_svg(&cfg.public) {
+            Ok(svg) => http_resp(&mut s, 200, "OK", "image/svg+xml", &svg),
+            Err(e) => http_resp(&mut s, 500, "ERR", "text/plain", &e),
+        },
+        ("GET", "/api/status") => match device_snapshot_json(&cfg.device) {
+            Ok(j) => http_resp(&mut s, 200, "OK", "application/json", &j),
+            Err(e) => http_resp(&mut s, 503, "ERR", "application/json", &format!("{{\"error\":\"{}\"}}", escape_json(&e))),
+        },
+        ("POST", "/api/outp") => {
+            let on: Option<bool> = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("on").and_then(|o| o.as_bool()));
+            let Some(on) = on else {
+                http_resp(&mut s, 400, "ERR", "text/plain", "bad body");
+                return;
+            };
+            if cfg.level == 0 {
+                ops_log(&cfg.log, &cfg.ops, &who, "DENY outp (Lv0)");
+                http_resp(&mut s, 403, "ERR", "text/plain", "Lv0は監視のみ");
+                return;
+            }
+            if cfg.level == 1 && on {
+                ops_log(&cfg.log, &cfg.ops, &who, "DENY outp ON (Lv1はOFFのみ)");
+                http_resp(&mut s, 403, "ERR", "text/plain", "Lv1は出力OFFのみ");
+                return;
+            }
+            if cfg.level == 2 && !authed(&target, &headers, &cfg.token) {
+                ops_log(&cfg.log, &cfg.ops, &who, "DENY outp (token)");
+                http_resp(&mut s, 403, "ERR", "text/plain", "token required");
+                return;
+            }
+            match scpi_outp(&cfg.device, on, Duration::from_millis(1500)) {
+                Ok(r) => {
+                    ops_log(&cfg.log, &cfg.ops, &who, &format!("outp on={on} -> {r}"));
+                    http_resp(&mut s, 200, "OK", "application/json", &format!("{{\"outp\":\"{}\"}}", escape_json(&r)));
+                }
+                Err(e) => http_resp(&mut s, 500, "ERR", "application/json", &format!("{{\"error\":\"{}\"}}", escape_json(&e))),
+            }
+        }
+        ("POST", "/api/apply") => {
+            if cfg.level != 2 || !authed(&target, &headers, &cfg.token) {
+                ops_log(&cfg.log, &cfg.ops, &who, "DENY apply (Lv2+token required)");
+                http_resp(&mut s, 403, "ERR", "text/plain", "Lv2+token required");
+                return;
+            }
+            let v: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    http_resp(&mut s, 400, "ERR", "text/plain", "bad body");
+                    return;
+                }
+            };
+            let (volt, curr) = (
+                v.get("volt").and_then(|x| x.as_f64()),
+                v.get("curr").and_then(|x| x.as_f64()),
+            );
+            let (Some(volt), Some(curr)) = (volt, curr) else {
+                http_resp(&mut s, 400, "ERR", "text/plain", "bad body");
+                return;
+            };
+            match scpi_apply(&cfg.device, volt, curr, Duration::from_millis(1500)) {
+                Ok(r) => {
+                    ops_log(&cfg.log, &cfg.ops, &who, &format!("apply {volt}V {curr}A"));
+                    http_resp(
+                        &mut s,
+                        200,
+                        "OK",
+                        "application/json",
+                        &format!(
+                            "{{\"volt\":\"{}\",\"curr\":\"{}\"}}",
+                            escape_json(&r.volt),
+                            escape_json(&r.curr)
+                        ),
+                    );
+                }
+                Err(e) => {
+                    let code = if e.contains("範囲外") || e.contains("超過") {
+                        400
+                    } else {
+                        500
+                    };
+                    http_resp(&mut s, code, "ERR", "application/json", &format!("{{\"error\":\"{}\"}}", escape_json(&e)));
+                }
+            }
+        }
+        _ => http_resp(&mut s, 404, "ERR", "text/plain", "not found"),
+    }
+}
+
+fn run_server(
+    bind: &str,
+    cfg: SrvCfg,
+) -> std::io::Result<(std::sync::Arc<AtomicBool>, std::thread::JoinHandle<()>, u16)> {
+    let listener = TcpListener::bind(bind)?;
+    let port = listener.local_addr()?.port();
+    listener.set_nonblocking(true)?;
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let h = std::thread::spawn(move || {
+        while !stop2.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((s, _)) => handle_client(s, &cfg),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    });
+    Ok((stop, h, port))
+}
+
+struct StoredServer {
+    stop: std::sync::Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    url: String,
+    level: u8,
+    log: std::path::PathBuf,
+    ops: std::sync::Arc<Mutex<u64>>,
+}
+
+static SERVER: OnceLock<Mutex<Option<StoredServer>>> = OnceLock::new();
+
+fn server_slot() -> &'static Mutex<Option<StoredServer>> {
+    SERVER.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Serialize)]
+struct ServerInfo {
+    url: String,
+    lan: String,
+    port: u16,
+    level: u8,
+    token: String,
+    qr: String,
+    log: String,
+}
+
+/// サーバーモード開始. LAN内利用想定 (0.0.0.0 Bind). Lv2は allow_lv2 明示＋トークン必須.
+#[tauri::command]
+fn server_start(
+    port: u16,
+    level: u8,
+    allow_lv2: bool,
+    device: String,
+) -> Result<ServerInfo, String> {
+    if level > 2 {
+        return Err("levelは0-2".into());
+    }
+    if level == 2 && !allow_lv2 {
+        return Err("Lv2フル操作には明示的な有効化が必要です".into());
+    }
+    let mut slot = server_slot().lock().map_err(|e| format!("lock: {e}"))?;
+    if slot.is_some() {
+        return Err("サーバー起動中です".into());
+    }
+    // 起動前に対象機器を確認 (誤Bind先での操作防止).
+    {
+        let mut p = open_port(&device)?;
+        std::thread::sleep(Duration::from_millis(200));
+        ensure_spe6103(&mut p, Duration::from_millis(1500))?;
+    }
+    let lan = lan_ip();
+    let token = make_token();
+    let dir = log_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir logs: {e}"))?;
+    let log = dir.join(format!("server_{}.log", epoch_secs()));
+    let ops = std::sync::Arc::new(Mutex::new(0u64));
+    if port == 0 {
+        return Err("ポート番号を指定してください (例: 8000)".into());
+    }
+    let public = if level == 2 {
+        format!("http://{lan}:{port}/?token={token}")
+    } else {
+        format!("http://{lan}:{port}/")
+    };
+    let qr = qr_svg(&public)?;
+    let cfg = SrvCfg {
+        device,
+        level,
+        token: token.clone(),
+        public: public.clone(),
+        log: log.clone(),
+        ops: ops.clone(),
+    };
+    let (stop, handle, actual) =
+        run_server(&format!("0.0.0.0:{port}"), cfg).map_err(|e| format!("bind失敗: {e}"))?;
+    debug_assert_eq!(actual, port);
+    *slot = Some(StoredServer {
+        stop,
+        handle: Some(handle),
+        url: public.clone(),
+        level,
+        log: log.clone(),
+        ops: ops.clone(),
+    });
+    ops_log(
+        &log,
+        &ops,
+        "server",
+        &format!("start Lv{level} {public}"),
+    );
+    Ok(ServerInfo {
+        url: public,
+        lan,
+        port: actual,
+        level,
+        token: if level == 2 { token } else { String::new() },
+        qr,
+        log: log.to_string_lossy().into_owned(),
+    })
+}
+
+/// サーバーモード停止.
+#[tauri::command]
+fn server_stop() -> Result<String, String> {
+    let mut slot = server_slot().lock().map_err(|e| format!("lock: {e}"))?;
+    match slot.take() {
+        Some(st) => {
+            st.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = st.handle {
+                let _ = h.join();
+            }
+            let n = st.ops.lock().map(|n| *n).unwrap_or(0);
+            Ok(format!("{} ({}ops)", st.log.to_string_lossy(), n))
+        }
+        None => Err("サーバーは起動していません".into()),
+    }
+}
+
+#[derive(Serialize)]
+struct ServerStatus {
+    running: bool,
+    url: String,
+    level: u8,
+    ops: u64,
+}
+
+#[tauri::command]
+fn server_status() -> Result<ServerStatus, String> {
+    let slot = server_slot().lock().map_err(|e| format!("lock: {e}"))?;
+    match slot.as_ref() {
+        Some(st) => Ok(ServerStatus {
+            running: true,
+            url: st.url.clone(),
+            level: st.level,
+            ops: st.ops.lock().map(|n| *n).unwrap_or(0),
+        }),
+        None => Ok(ServerStatus {
+            running: false,
+            url: String::new(),
+            level: 0,
+            ops: 0,
+        }),
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -496,10 +1022,167 @@ fn main() {
             preset_save,
             preset_delete,
             preset_import,
+            server_start,
+            server_stop,
+            server_status,
             log_start,
             log_append,
             log_stop
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TLOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn dev_port() -> String {
+        std::env::var("SPE6103_PORT").unwrap_or_else(|_| "COM7".into())
+    }
+
+    fn http_raw(port: u16, req: &str) -> String {
+        let mut s = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("timeout");
+        s.write_all(req.as_bytes()).expect("write");
+        let mut out = Vec::new();
+        let mut one = [0u8; 1024];
+        loop {
+            match s.read(&mut one) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&one[..n]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn get(port: u16, target: &str) -> String {
+        http_raw(
+            port,
+            &format!("GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
+    fn post(port: u16, target: &str, body: &str) -> String {
+        http_raw(
+            port,
+            &format!(
+                "POST {target} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    struct TestSrv {
+        stop: std::sync::Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    fn start_test_srv(bind_port: u16, level: u8, token: &str) -> TestSrv {
+        let log = std::env::temp_dir().join(format!("spe6103_test_{bind_port}.log"));
+        let _ = std::fs::remove_file(&log);
+        let cfg = SrvCfg {
+            device: dev_port(),
+            level,
+            token: token.into(),
+            public: format!("http://127.0.0.1:{bind_port}/"),
+            log,
+            ops: std::sync::Arc::new(Mutex::new(0)),
+        };
+        let (stop, handle, actual) =
+            run_server(&format!("127.0.0.1:{bind_port}"), cfg).expect("bind");
+        assert_eq!(actual, bind_port);
+        TestSrv {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    impl Drop for TestSrv {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn lv1_status_and_off_guard() {
+        let _g = TLOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let srv = start_test_srv(18081, 1, "unused");
+        let st = get(18081, "/api/status");
+        assert!(st.starts_with("HTTP/1.1 200"), "status: {st}");
+        assert!(st.contains("meas_volt"), "body: {st}");
+        // Lv1では出力ONを拒否
+        let deny = post(18081, "/api/outp", "{\"on\":true}");
+        assert!(deny.starts_with("HTTP/1.1 403"), "deny: {deny}");
+        // Lv1では出力OFFを許可
+        let off = post(18081, "/api/outp", "{\"on\":false}");
+        let off_body = off.clone();
+        // 先に復元してからassert (失敗時もONに戻す)
+        let back = scpi_outp(&dev_port(), true, Duration::from_millis(1500)).expect("restore ON");
+        assert!(off.starts_with("HTTP/1.1 200"), "off: {off_body}");
+        assert!(off_body.contains("OFF"), "off: {off_body}");
+        assert!(back.contains("ON"), "restore: {back}");
+        drop(srv);
+    }
+
+    #[test]
+    fn lv2_token_flow() {
+        let _g = TLOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let srv = start_test_srv(18082, 2, "TOK123");
+        // トークンなしapplyは403
+        let deny = post(18082, "/api/apply", "{\"volt\":8.4,\"curr\":1.25}");
+        assert!(deny.starts_with("HTTP/1.1 403"), "deny: {deny}");
+        // トークンあり・同値適用 (状態不変) は200
+        let ok = post(
+            18082,
+            "/api/apply?token=TOK123",
+            "{\"volt\":8.4,\"curr\":1.25}",
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "ok: {ok}");
+        assert!(ok.contains("8.400"), "ok: {ok}");
+        // 範囲外は400
+        let bad = post(
+            18082,
+            "/api/apply?token=TOK123",
+            "{\"volt\":61.0,\"curr\":1.0}",
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "bad: {bad}");
+        drop(srv);
+    }
+
+    #[test]
+    fn server_commands_roundtrip() {
+        let _g = TLOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        // Lv2は明示的有効化なしでは拒否
+        assert!(server_start(18085, 2, false, dev_port()).is_err());
+        let info = server_start(18084, 1, false, dev_port()).expect("start");
+        assert!(info.url.contains("18084"), "url: {}", info.url);
+        assert!(info.qr.contains("<svg"), "qr");
+        let st = server_status().expect("status");
+        assert!(st.running && st.level == 1, "status");
+        let dash = get(18084, "/");
+        assert!(dash.contains("出力OFF"), "dash Lv1");
+        let done = server_stop().expect("stop");
+        assert!(done.contains("ops)"), "stop: {done}");
+        assert!(!server_status().expect("status2").running);
+    }
+
+    #[test]
+    fn lv0_readonly() {        let _g = TLOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let srv = start_test_srv(18083, 0, "unused");
+        let st = get(18083, "/api/status");
+        assert!(st.starts_with("HTTP/1.1 200"), "status: {st}");
+        let dash = get(18083, "/");
+        assert!(dash.contains("監視のみ"), "dash readonly");
+        let deny = post(18083, "/api/outp", "{\"on\":false}");
+        assert!(deny.starts_with("HTTP/1.1 403"), "deny: {deny}");
+        drop(srv);
+    }
 }
